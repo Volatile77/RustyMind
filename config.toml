@@ -1,0 +1,45 @@
+[server]
+host = "0.0.0.0"
+port = 8080
+workers = 4
+
+[ollama]
+api_url = "http://172.18.0.111:11434"
+model = "deepseek-r1:8b"
+system_prompt = "Format all responses in markdown."
+keep_alive = "15m"
+timeout_seconds = 300
+
+[cache]
+# Cache size in MB
+max_size_mb = 256
+# Time-to-live in seconds
+ttl_seconds = 3600
+# Enable/disable caching
+enabled = true
+
+[conversation_cache]
+max_size_mb = 128
+ttl_seconds = 7200
+enabled = true
+
+[queue]
+# Maximum concurrent GPU requests
+max_concurrent = 1
+# Estimated time per request (for ETA calculation)
+estimated_time_per_request_ms = 30000
+
+[batch]
+# Maximum requests per batch
+max_batch_size = 3
+# Timeout before processing incomplete batch (ms)
+batch_timeout_ms = 2000
+# Enable request deduplication
+enable_deduplication = true
+
+[cors]
+# Allow all origins for development
+# In production, set specific origins
+allowed_origins = ["*"]
+allowed_methods = ["GET", "POST", "DELETE", "OPTIONS"]
+allowed_headers = ["*"]

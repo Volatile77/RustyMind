@@ -1,0 +1,13 @@
+target/
+Cargo.lock
+.env
+.env.*
+*.log
+.git
+.gitignore
+README.md
+MIGRATION_GUIDE.md
+COMPARISON.md
+scripts/
+.vscode/
+.idea/

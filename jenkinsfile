@@ -1,0 +1,246 @@
+pipeline {
+    agent any
+    
+    environment {
+        APPROVER = "amit,dipanmallick"
+        Email= "amit.das@iserveu.co.in"
+        Service_Name= "ssi-chat-fs"
+        Project_Name= "isu-internal"
+        Region_Name= "asia-south1-a"
+        Container_Port= "8080"
+        Devops_Mail_Id="devops-git@iserveu.in"
+        Sonar_Url="https://sonarnew.inttxn.com/"
+        Name_Space="ssi"    
+        Google_Registry_Location="asia-docker.pkg.dev"
+        Google_Repository_Name="asia.gcr.io"
+        Docker_Image_Path="${Google_Registry_Location}/${Project_Name}/${Google_Repository_Name}/${Service_Name}"
+        Onprem_Credential_Id="onprem-ssi-creds"
+    }
+    stages {
+      
+        stage('Build image') {
+            steps {
+                script {
+                    try {
+                        sh "docker build --tag ${env.Docker_Image_Path} -f Dockerfile ."
+                    } catch (Exception e) {
+                        sendFailureNotification("Docker image build failed")
+                        exit(1)
+                    }
+                }
+            }
+        }
+
+        
+        stage("Push to Google Artifact Registry") {
+            steps {
+                script {
+                    try {
+                        withCredentials([file(credentialsId: 'isu-internal-artifact', variable: 'artifactregistry')]) {               
+                            sh "gcloud auth activate-service-account --key-file=${artifactregistry}" 
+                            sh "gcloud auth configure-docker ${env.Google_Registry_Location}"
+                            sh "docker push ${env.Docker_Image_Path}:latest"
+                        }
+                    } catch (Exception e) {
+                        sendFailureNotification("Push to Google Artifact Registry failed")
+                        exit(1)
+                    }
+                }
+            }
+        }
+
+
+        
+        stage("K8-deployment") {
+            steps {
+                script {        
+                    try {
+                        // Send approval request email
+                        emailext(
+                            to: "${env.Email}",
+                            replyTo: "${env.Devops_Mail_Id}",
+                            subject: "Waiting for teamlead Approval! Job: '${env.JOB_NAME} [${env.BUILD_NUMBER}]'",
+                            body: """Waiting for teamlead Approval! Job: \n\nConsole: ${env.BUILD_URL}.\n\n :
+                                STARTED: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]':
+                                Check console output at "${env.JOB_NAME} [${env.BUILD_NUMBER}]"
+                            """,
+                            recipientProviders: [[$class: 'DevelopersRecipientProvider']]
+                        )
+
+                        // Get approval from team lead
+                        def submitterName = env.APPROVER
+                        echo "hi submitter ${submitterName}"
+                        
+                        timeout(time: 30, unit: 'MINUTES') {
+                            input message: 'Waiting for APPROVER Approval!', submitter: submitterName    
+                        }
+                        def IMAGE_DIGEST=""
+
+                        withCredentials([file(credentialsId: 'k8-jenkins-deployment', variable: 'k8deploye')]) {
+                            timeout(time: 6, unit: 'MINUTES') { 
+                             
+                                IMAGE_DIGEST = sh(
+                                    script: "gcloud container images describe ${env.Docker_Image_Path}:latest --format=\"value(image_summary.digest)\"",
+                                    returnStdout: true
+                                ).trim()
+
+                                echo "Received digest: ${IMAGE_DIGEST}"
+                        }
+
+                        withKubeConfig(caCertificate: '', clusterName: 'kubernetes', contextName: '', credentialsId: "${env.Onprem_Credential_Id}", namespace: "${env.Name_Space}", restrictKubeConfigAccess: false, serverUrl: 'https://172.18.0.100:6443') {
+
+                     
+                        // Deploy to Kubernetes
+                        echo "deploying to onprem"
+                                
+                                // Apply Kubernetes deployment
+                                sh """kubectl apply -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${env.Service_Name}
+  namespace: ${env.Name_Space}
+ 
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ${env.Service_Name}
+  template:
+    metadata:
+      labels:
+        app: ${env.Service_Name}
+        sidecar.istio.io/inject: "false"
+    spec:
+      imagePullSecrets:
+        - name: gcp-secret
+      containers:
+      - name: ${env.Service_Name}-1
+        image: ${env.Docker_Image_Path}@${IMAGE_DIGEST}
+        ports:
+        - containerPort: ${env.Container_Port}
+        envFrom:
+        - secretRef:
+            name: ssi-fs-secrets
+        env:
+        - name: GOOGLE_APPLICATION_CREDENTIALS
+          value: /var/secrets/google/key.json
+        volumeMounts:
+        - name: gcp-secret
+          mountPath: /var/secrets/google
+          readOnly: true
+      volumes:
+      - name: gcp-secret
+        secret:
+          secretName: gcp-secret-manager-key
+EOF
+"""                        
+                                
+                                sh "kubectl rollout status deployment/${env.Service_Name} -n ${env.Name_Space}"             
+                            }
+                        }
+                    } catch (Exception e) {
+                        sendFailureNotification("Kubernetes deployment failed")
+                        exit(1)
+                    }
+                }
+            }
+        }
+
+        stage('Service Creation') {
+            steps {
+                script {
+                    try {
+                        withKubeConfig(caCertificate: '', clusterName: 'kubernetes', contextName: '', credentialsId: "${env.Onprem_Credential_Id}", namespace: "${env.Name_Space}", restrictKubeConfigAccess: false, serverUrl: 'https://172.18.0.100:6443') {
+
+                            timeout(time: 3, unit: 'MINUTES') {
+                                withCredentials([file(credentialsId: 'k8-jenkins-deployment', variable: 'k8deploye')]) {
+                                    sh "gcloud auth activate-service-account --key-file=${k8deploye}"
+
+                                    def serviceExists = sh(
+                                        script: "kubectl get service ${env.Service_Name} -n ${env.Name_Space} >/dev/null 2>&1",
+                                        returnStatus: true
+                                    )
+
+                                    if (serviceExists != 0) {
+                                        echo "Service ${env.Service_Name} not found. Creating ClusterIP service for internal communication..."
+
+                                        // Create ClusterIP service (internal only)
+                                        // DNS name will be: ssi-chat-fs.ssi.svc.cluster.local:8080
+                                        sh "kubectl expose deployment ${env.Service_Name} --port=${env.Container_Port} --target-port=${env.Container_Port} --name=${env.Service_Name} --type=ClusterIP -n ${env.Name_Space}"
+                                    } else {
+                                        echo "Service ${env.Service_Name} already exists in namespace ${env.Name_Space}"
+                                    }
+
+                                    // Verify service is ready
+                                    sh "kubectl get service ${env.Service_Name} -n ${env.Name_Space}"
+                                    sh "kubectl rollout status deployment/${env.Service_Name} -n ${env.Name_Space}"
+                                }
+                            }
+                        }
+                    } catch (Exception e) {
+                        sendFailureNotification("Service creation failed")
+                        exit(1)
+                    }
+                }
+            }
+        }
+        
+        stage('Clean Workspace') {
+            steps {
+                cleanWs()
+            }
+        }
+    }
+
+    post {
+        always {
+            cleanWs()
+            echo "Pipeline finished"
+            sendEmail(
+                "k8 build Pipeline finished",
+                "k8 build Pipeline finished - please check logs.\n\nConsole: ${env.BUILD_URL}.\n\n"
+            )
+        }
+        
+        failure {
+                        cleanWs()
+
+            sh "echo 'Pipeline failed'"
+            sendEmail(
+                "k8 build Pipeline failed",
+                "k8 build Pipeline failed - please check logs.\n\nConsole: ${env.BUILD_URL}.\n\n"
+            )
+        }
+        
+        aborted {
+                        cleanWs()
+
+            sh "echo 'Pipeline aborted'"
+            sendEmail(
+                "k8 build Pipeline aborted",
+                "k8 build Pipeline aborted - please check logs.\n\nConsole: ${env.BUILD_URL}.\n\n"
+            )
+        }
+    }
+}
+
+// Helper function for standard email notification
+def sendEmail(String subject, String body) {
+    emailext(
+        to: "${env.Email}",
+        replyTo: "${env.Devops_Mail_Id}",
+        subject: "${subject} : ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+        body: body,
+        mimeType: 'text/html',
+        attachLog: true
+    )
+}
+
+// Helper function for failure notifications
+def sendFailureNotification(String errorMessage) {
+    sendEmail(
+        "${errorMessage}",
+        "${errorMessage} from stage.\n\nConsole: ${env.BUILD_URL}.\n\n"
+    )
+}
